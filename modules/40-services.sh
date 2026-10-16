@@ -94,6 +94,30 @@ stage_services() {
       && svc_off disable "iSCSI" iscsi-onboot.service iscsi.service iscsid.socket iscsiuio.socket
   fi
 
+  if unit_exists fstrim.timer && [[ $(unit_enabled_state fstrim.timer) != enabled ]] \
+     && lsblk -dno ROTA 2>/dev/null | grep -qx ' *0'; then
+    if propose safe "Enable weekly SSD TRIM (fstrim.timer)" \
+        "Tells your SSDs once a week which blocks are free, which keeps write performance steady over time. Fedora normally enables this; it is currently off here." \
+        "Nothing." \
+        "./FedoraTweaks rollback — or: sudo systemctl disable --now fstrim.timer"; then
+      sudo_run systemctl enable --now fstrim.timer && journal_add "Enabled fstrim.timer" "sudo systemctl disable --now fstrim.timer"
+    fi
+  fi
+
+  if [[ ! -f /etc/systemd/journald.conf.d/90-fedoratweaks.conf ]]; then
+    local jsize
+    jsize=$(journalctl --disk-usage 2>/dev/null | grep -oE '[0-9.]+[KMGT]' | head -n 1)
+    if propose optional "Cap system logs at 500 MB (currently ${jsize:-unknown})" \
+        "journald may keep up to 10% of the filesystem (max 4 GB) of logs. This caps it at 500 MB — weeks of history on a desktop." \
+        "Older log history beyond the cap." \
+        "./FedoraTweaks rollback — or delete /etc/systemd/journald.conf.d/90-fedoratweaks.conf"; then
+      sudo_run mkdir -p /etc/systemd/journald.conf.d \
+        && root_write /etc/systemd/journald.conf.d/90-fedoratweaks.conf "[Journal]
+SystemMaxUse=500M" "journald 500 MB cap" "sudo systemctl restart systemd-journald" \
+        && sudo_run systemctl restart systemd-journald
+    fi
+  fi
+
   note "Deliberately kept" \
     "NetworkManager, systemd-resolved, D-Bus, polkit, SELinux, firewalld, systemd-oomd, PipeWire/WirePlumber, chronyd (clock), fwupd, tuned/tuned-ppd (power profiles), smartd (disk health), the display manager, udisks2 (USB drives) and switcheroo-control (needed when the Ryzen iGPU and a discrete GPU are both active). sssd is left alone: Fedora's authentication stack may use it."
 }

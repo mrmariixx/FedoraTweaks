@@ -32,6 +32,10 @@ vm.page-cluster = 0" "zram sysctl tuning" && sudo_run sysctl --system >/dev/null
 }
 
 tune_ntsync() {
+  if [[ -e /dev/ntsync ]] && lsmod | grep -q '^ntsync'; then
+    ok "ntsync is loaded (Fedora 44+ does this by default) — Proton uses /dev/ntsync automatically."
+    return 0
+  fi
   if ! modinfo ntsync >/dev/null 2>&1; then
     info "This kernel has no ntsync module — skipping."
     return 0
@@ -64,6 +68,55 @@ MESA_SHADER_CACHE_MAX_SIZE=10G" "Mesa shader cache 10G"
   fi
 }
 
+tune_x3d_vcache() {
+  local f cur
+  f=$(compgen -G '/sys/bus/platform/drivers/amd_x3d_vcache/*/amd_x3d_mode' | head -n 1)
+  [[ -n $f ]] || return 0   # only dual-CCD Ryzen X3D CPUs (e.g. 7950X3D, 9950X3D) expose this
+  cur=$(cat "$f" 2>/dev/null)
+  if [[ $cur == cache ]]; then ok "3D V-Cache mode is already 'cache'."; return 0; fi
+  if propose optional "Prefer the 3D V-Cache CCD for games (amd_x3d_mode=cache, currently '$cur')" \
+      "Your CPU has two core complexes (CCDs) and only one carries the stacked 3D V-Cache. The kernel's amd_x3d_vcache driver can make the scheduler fill the cache CCD first — what most games want — instead of the higher-clocked CCD (the default, 'frequency'). Applied now and at every boot through systemd-tmpfiles." \
+      "Some lightly-threaded productivity work runs a little slower. Phoronix benchmarks show the effect is workload-dependent: compare MangoHud logs before keeping it." \
+      "./FedoraTweaks rollback — or: echo frequency | sudo tee $f"; then
+    root_write /etc/tmpfiles.d/90-fedoratweaks-x3d.conf "# FedoraTweaks: prefer the 3D V-Cache CCD (remove this file to revert)
+w $f - - - - cache" "3D V-Cache mode 'cache' at boot" "echo $cur | sudo tee $f >/dev/null"
+    if [[ $FT_DRY_RUN != 1 ]]; then
+      echo cache | sudo tee "$f" >/dev/null && ok "amd_x3d_mode is now '$(cat "$f")'."
+    fi
+  fi
+}
+
+tune_writeback() {
+  local f=/etc/sysctl.d/90-fedoratweaks-writeback.conf memg
+  [[ -f $f ]] && { ok "Write-back limits already applied."; return 0; }
+  memg=$(awk '/^MemTotal:/ { printf "%d", $2 / 1048576 }' /proc/meminfo)
+  if propose optional "Smaller disk write-back bursts (vm.dirty_bytes = 256 MB)" \
+      "By default Linux lets up to 20% of RAM (≈ $(( memg * 20 / 100 )) GB here) of unwritten data pile up and then flushes it in one burst. Big Steam downloads, game installs or shader-cache writes in the background can then cause a hitch in the game you are playing. Capping dirty data at 256 MB (background flushing from 64 MB) keeps writes small and steady." \
+      "Slightly lower peak speed for very large file copies. No effect when nothing is being written." \
+      "./FedoraTweaks rollback — values return to the defaults after a reboot"; then
+    root_write "$f" "# FedoraTweaks: small, steady write-back instead of multi-GB bursts. Remove to revert (reboot).
+vm.dirty_bytes = 268435456
+vm.dirty_background_bytes = 67108864" "Write-back limits" && sudo_run sysctl --system >/dev/null
+  fi
+}
+
+tune_pipewire_latency() {
+  command -v pw-metadata >/dev/null 2>&1 || return 0
+  local f="$HOME/.config/pipewire/pipewire.conf.d/90-fedoratweaks-lowlatency.conf"
+  [[ -f $f ]] && { ok "PipeWire low-latency config already present."; return 0; }
+  if propose optional "Lower default audio latency (PipeWire quantum 256 ≈ 5 ms)" \
+      "When an app does not request its own buffer size, PipeWire uses 1024 samples (≈ 21 ms at 48 kHz). Lowering the default to 256 (≈ 5 ms) makes game sounds and voice chat react sooner. Try it first without changing files: 'pw-metadata -n settings 0 clock.force-quantum 256' (reset with 0) and watch 'pw-top' for xruns." \
+      "A little more CPU wake-up overhead; on some sound hardware crackling — then roll back or use 512." \
+      "./FedoraTweaks rollback, then: systemctl --user restart pipewire pipewire-pulse wireplumber"; then
+    user_write "$f" "# FedoraTweaks: lower default PipeWire buffer (delete this file to revert)
+context.properties = {
+    default.clock.quantum     = 256
+    default.clock.min-quantum = 32
+    default.clock.max-quantum = 2048
+}" "PipeWire default quantum 256" && run systemctl --user restart pipewire pipewire-pulse wireplumber
+  fi
+}
+
 report_kernel_defaults() {
   local mmc
   mmc=$(sysctl -n vm.max_map_count 2>/dev/null)
@@ -84,6 +137,9 @@ stage_tuning() {
   tune_zram
   tune_ntsync
   tune_shader_cache
+  tune_x3d_vcache
+  tune_writeback
+  tune_pipewire_latency
 
   local scx_repo
   scx_repo=$(dnf repoquery --available --qf '%{repoid}\n' scx-scheds 2>/dev/null | head -n 1)
@@ -100,5 +156,9 @@ stage_tuning() {
 • amdgpu.ppfeaturemask / forcing power_dpm_force_performance_level=high: unlocks overclocking/fan control or pins clocks; raises heat and power, can cause instability, and recent kernels may flag the system as tainted. Not a general speed-up.
 • Custom kernels (CachyOS, Zen, XanMod): not signed with Fedora's key, so they break Secure Boot and EAC Linux v2. Fedora's kernel already has a current scheduler (EEVDF), amd-pstate and the latest amdgpu.
 • iommu=pt: conflicts with EAC Linux v2 and brings no gaming benefit.
+• kernel.nmi_watchdog=0 / nowatchdog: removes a periodic NMI and frees one CPU performance counter; the effect on games is below measurement noise.
+• Transparent hugepages 'always': no consistent gaming gain and can add latency spikes from memory compaction. Fedora's 'madvise' default lets programs that benefit opt in.
+• TCP BBR / qdisc changes: affect bulk download throughput, not in-game ping.
+• noatime: Fedora already uses relatime on Btrfs/SSD; the difference is negligible.
 • 'Gaming' sysctl bundles, I/O scheduler swaps, disabling journald/SELinux/firewalld, disabling zram: placebo or harmful."
 }

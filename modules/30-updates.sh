@@ -12,6 +12,18 @@ stage_updates() {
     sudo_run dnf upgrade --refresh
   fi
 
+  local mpd
+  mpd=$(grep -rhsE '^\s*max_parallel_downloads\s*=' /etc/dnf/dnf.conf /etc/dnf/libdnf5.conf.d/ 2>/dev/null | tail -n 1 | tr -dc 0-9)
+  if [[ -z $mpd || $mpd -lt 10 ]]; then
+    if propose optional "Faster DNF downloads (10 parallel downloads, currently ${mpd:-default})" \
+        "Lets dnf download up to 10 packages at once instead of a few, which shortens big updates noticeably on fast connections." \
+        "Nothing; slightly more simultaneous connections to mirrors." \
+        "./FedoraTweaks rollback — or: sudo dnf config-manager unsetopt max_parallel_downloads"; then
+      sudo_run dnf config-manager setopt max_parallel_downloads=10 \
+        && journal_add "dnf max_parallel_downloads=10" "sudo dnf config-manager unsetopt max_parallel_downloads"
+    fi
+  fi
+
   if command -v fwupdmgr >/dev/null 2>&1; then
     if propose safe "Check device firmware updates (LVFS / fwupd)" \
         "Refreshes LVFS metadata and lists firmware updates for devices that support it (SSDs, some peripherals, sometimes UEFI)." \

@@ -31,12 +31,12 @@ That starts the guided setup. It inspects the system, records a baseline, then w
 | `audit` | Read-only audit of release, kernel, CPU/GPU/RAM/storage/board, Plasma and Wayland, packages, services/timers, autostart, RAM/CPU, boot time, Mesa/Vulkan/firmware, ReBAR, Secure Boot/TPM. Saved as a shareable text report |
 | `baseline` | Measures idle RAM, idle CPU (30 s sample), process and service counts, boot phases, idle temperatures/clocks/power |
 | `compare` | Before/after table between two baselines, plus removed packages and services |
-| `updates` | `dnf upgrade --refresh`, LVFS firmware check, pending-reboot check |
-| `services` | CUPS, Avahi, Bluetooth, ModemManager, boot network wait, dnf-makecache, plocate, mdraid/LVM/iSCSI monitors (each only if it exists and is enabled or running) |
-| `packages` | VM guest tools, ABRT, DrKonqi, KDE PIM/Akonadi, LibreOffice, KDE games, extra media apps, KDE Connect, remote/chat apps, rarely used utilities, printing extras, browser integration, Discover, Orca, `dnf autoremove` |
-| `kde` | Baloo indexing, empty session at login, animations, blur/contrast, tearing for fullscreen games, autostart overrides |
-| `gaming` | 32-bit Mesa Vulkan, GameMode, MangoHud (+ benchmark config), nvtop/lm_sensors, RPM Fusion, native Steam RPM, freeworld VA-API |
-| `tuning` | Power profile, zram sysctls, ntsync, Mesa shader cache size, plus an explained list of tweaks that are *not* applied |
+| `updates` | `dnf upgrade --refresh`, faster parallel downloads, LVFS firmware check, pending-reboot check |
+| `services` | CUPS, Avahi, Bluetooth, ModemManager, boot network wait, dnf-makecache, plocate, mdraid/LVM/iSCSI monitors (each only if it exists and is enabled or running), SSD TRIM timer, journal size cap |
+| `packages` | VM guest tools, ABRT, DrKonqi, KDE PIM/Akonadi, LibreOffice, KDE games, extra media apps, KDE Connect, remote/chat apps, rarely used utilities, printing extras, browser integration, Discover, Orca, unused Flatpak runtimes, `dnf autoremove` |
+| `kde` | Baloo indexing, empty session at login, animations, blur/contrast, tearing for fullscreen games, autostart overrides, login splash, mouse-acceleration guide |
+| `gaming` | 32-bit Mesa Vulkan, GameMode (+ priority config), MangoHud (+ benchmark config and FPS limiter), nvtop/lm_sensors, RPM Fusion, native Steam RPM, freeworld VA-API, Lutris, Flathub + ProtonPlus + Heroic |
+| `tuning` | Power profile, zram sysctls, ntsync, Mesa shader cache size, 3D V-Cache CCD preference (X3D), write-back limits, low-latency PipeWire, plus an explained list of tweaks that are *not* applied |
 | `anticheat` | Fortnite / EAC Linux v2 readiness check against Epic's published requirements, with an option to set the kernel command line |
 | `status` / `rollback` | Show or undo applied changes |
 | `bench <log.csv>` | Average FPS, 1% and 0.1% lows, frametime mean/stdev/p99 from MangoHud logs (works on any distro) |

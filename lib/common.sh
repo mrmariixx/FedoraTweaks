@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # Shared helpers for FedoraTweaks. Sourced by ./FedoraTweaks — never executed directly.
 
-FT_VERSION="0.1.0"
+FT_VERSION="0.2.0"
 FT_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/fedoratweaks"
 FT_JOURNAL="$FT_STATE_DIR/journal.tsv"
 FT_BACKUP_DIR="$FT_STATE_DIR/backups"

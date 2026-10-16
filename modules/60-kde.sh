@@ -104,6 +104,19 @@ stage_kde() {
     fi
   done
 
+  # --- Login splash --------------------------------------------------------
+  if [[ $(kde_get ksplashrc KSplash Engine) == none ]]; then
+    ok "Login splash screen is already off."
+  elif propose optional "Skip the splash screen after login" \
+      "Turns off Plasma's splash animation (ksplashrc Engine=none), so the desktop shows as soon as it is ready instead of after the animation." \
+      "The splash animation." \
+      "./FedoraTweaks rollback — or System Settings › Colors & Themes › Splash Screen"; then
+    kde_set ksplashrc KSplash Engine none
+    kde_set ksplashrc KSplash Theme None
+  fi
+
+  note "Mouse acceleration (do this by hand)" \
+    "For consistent aim, open System Settings › Mouse & Touchpad, pick your mouse and set the acceleration profile to 'None' (flat), leaving speed at the default. It is not scripted because Plasma stores it per device under keys that are not documented. Verify with: sudo libinput list-devices (look at 'Accel profile'). Many games use raw input and ignore it anyway."
   note "Thumbnails and file previews" \
     "Not changed. Dolphin generates previews only for folders you open, so disabling them saves nothing while gaming."
   note "Widgets and kded modules" \

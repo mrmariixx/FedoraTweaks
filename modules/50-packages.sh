@@ -117,6 +117,15 @@ stage_packages() {
     "Spoken screen reading. KEEP this if you or anyone using this PC needs it." \
     orca
 
+  if command -v flatpak >/dev/null 2>&1 && [[ -n $(flatpak list --runtime --columns=application 2>/dev/null) ]]; then
+    if propose safe "Remove unused Flatpak runtimes" \
+        "Runs 'flatpak uninstall --unused', which removes runtimes and extensions that no installed app needs any more (often several GB after app updates). flatpak lists them and asks before removing." \
+        "Nothing; a runtime is downloaded again automatically if an app needs it later." \
+        "Not needed — removed runtimes are reinstalled on demand."; then
+      sudo_run flatpak uninstall --unused
+    fi
+  fi
+
   explain "Finally, dnf can remove packages that were only installed as dependencies and are no longer needed by anything."
   local -a auto=()
   local plan

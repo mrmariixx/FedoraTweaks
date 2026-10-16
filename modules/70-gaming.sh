@@ -62,7 +62,80 @@ toggle_hud=Shift_R+F12
 toggle_logging=Shift_L+F2
 output_folder=$logdir
 log_duration=60
-autostart_log=0" "MangoHud config"
+autostart_log=0
+# FPS cap for VRR monitors: list values and cycle with Shift_L+F1, e.g. fps_limit=0,141 (refresh rate minus 3)
+fps_limit=0
+fps_limit_method=late
+toggle_fps_limit=Shift_L+F1" "MangoHud config"
+  fi
+}
+
+gaming_flathub_apps() {
+  command -v flatpak >/dev/null 2>&1 || { info "flatpak is not installed — skipping Flathub apps."; return 0; }
+  local filter opts
+  if ! flatpak remotes --system --columns=name 2>/dev/null | grep -qx flathub; then
+    if propose optional "Add the Flathub repository" \
+        "Adds Flathub (flathub.org), the main Flatpak app store, system-wide. Needed for ProtonPlus and Heroic below." \
+        "Nothing; it adds a software source." \
+        "./FedoraTweaks rollback — or: sudo flatpak remote-delete flathub"; then
+      sudo_run flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo \
+        && journal_add "Added Flathub remote" "sudo flatpak remote-delete --force flathub"
+    fi
+  else
+    filter=$(flatpak remotes --system --columns=name,filter 2>/dev/null | awk '$1 == "flathub" { print $2 }')
+    opts=$(flatpak remotes --system --columns=name,options 2>/dev/null | awk '$1 == "flathub" { print $2 }')
+    if [[ ( -n $filter && $filter != - ) || $opts == *disabled* ]]; then
+      if propose optional "Enable the full Flathub catalogue" \
+          "Fedora ships Flathub disabled or filtered to a small list of apps, which hides ProtonPlus and Heroic. This enables it and removes the filter." \
+          "Nothing; more apps become available." \
+          "./FedoraTweaks rollback"; then
+        sudo_run flatpak remote-modify --enable --no-filter flathub \
+          && journal_add "Enabled/unfiltered Flathub" "sudo flatpak remote-modify $( [[ $opts == *disabled* ]] && echo --disable ) $( [[ -n $filter && $filter != - ]] && printf -- '--filter=%q' "$filter" ) flathub"
+      fi
+    fi
+  fi
+  flatpak remotes --system --columns=name 2>/dev/null | grep -qx flathub || return 0
+
+  local entry id name what
+  for entry in \
+    "com.vysp3r.ProtonPlus|ProtonPlus|Installs and updates community Proton builds (Proton-GE and others) for Steam, Lutris and Heroic. Some games run better — or only — with Proton-GE; pick it per game in Steam › Properties › Compatibility." \
+    "com.heroicgameslauncher.hgl|Heroic Games Launcher|Open-source launcher for the Epic Games Store, GOG and Amazon Games, running games through Proton/Wine with per-game settings."; do
+    IFS='|' read -r id name what <<<"$entry"
+    if flatpak info --system "$id" >/dev/null 2>&1; then ok "$name is already installed."; continue; fi
+    if propose optional "$name (Flatpak, Flathub)" "$what" "Nothing; about 100–300 MB of disk." \
+        "./FedoraTweaks rollback — or: flatpak uninstall $id"; then
+      sudo_run flatpak install -y --system flathub "$id" \
+        && journal_add "Installed Flatpak $id" "sudo flatpak uninstall -y --system $id"
+    fi
+  done
+}
+
+gaming_gamemode_config() {
+  pkg_installed gamemode || return 0
+  local cfg="$HOME/.config/gamemode.ini"
+  if [[ -f $cfg ]]; then
+    ok "GameMode config already exists ($cfg) — leaving it alone."
+  elif propose optional "GameMode: raise the game's CPU and I/O priority" \
+      "Writes $cfg so that, while a game started with 'gamemoderun' runs, GameMode also renices it (nice -10) and gives it the highest best-effort I/O priority. GPU settings stay untouched on purpose." \
+      "Nothing; it only applies while a GameMode game runs. Renicing needs the 'gamemode' group (offered next)." \
+      "./FedoraTweaks rollback — or delete $cfg"; then
+    user_write "$cfg" "; Written by FedoraTweaks — see 'man gamemoded'
+[general]
+renice=10
+ioprio=0
+inhibit_screensaver=1
+
+[gpu]
+; GPU tuning (forced clocks/overclocks) is deliberately left off — see docs/WHATDOESITDO.md
+;apply_gpu_optimisations=accept-responsibility" "GameMode config"
+  fi
+  if getent group gamemode >/dev/null && ! id -nG | tr ' ' '\n' | grep -qx gamemode; then
+    if propose optional "Add $USER to the 'gamemode' group" \
+        "Lets GameMode renice games (required for the setting above). Takes effect after logging out and back in." \
+        "Nothing." \
+        "./FedoraTweaks rollback — or: sudo gpasswd -d $USER gamemode"; then
+      sudo_run usermod -aG gamemode "$USER" && journal_add "Added $USER to group gamemode" "sudo gpasswd -d $USER gamemode"
+    fi
   fi
 }
 
@@ -138,13 +211,22 @@ stage_gaming() {
     fi
   fi
 
+  if propose optional "Lutris (native RPM, Fedora repository)" \
+      "Game manager for Battle.net, EA app, Ubisoft Connect, emulators and other non-Steam games, with ready-made install scripts." \
+      "Nothing; adds Wine-related dependencies." \
+      "./FedoraTweaks rollback"; then
+    install_pkgs "Lutris" lutris
+  fi
+  gaming_gamemode_config
+  gaming_flathub_apps
+
   if command -v vulkaninfo >/dev/null 2>&1 && [[ $FT_DRY_RUN != 1 ]]; then
     info "Vulkan devices:"
     vulkaninfo --summary 2>/dev/null | grep -E 'deviceName|driverName|driverInfo' | sed 's/^/    /'
   fi
 
   note "Fan control and overclocking" \
-    "The GPU firmware already runs a sensible fan curve. Custom fan curves, undervolting and power limits need amdgpu 'overdrive' (kernel parameter amdgpu.ppfeaturemask), which may flag the kernel as tainted. GUI tools such as LACT come from third-party repositories (verify with 'dnf info lact'). This tool does not enable overdrive; see docs/PLAN.md."
+    "The GPU firmware already runs a sensible fan curve. Custom fan curves, undervolting and power limits need amdgpu 'overdrive' (kernel parameter amdgpu.ppfeaturemask), which may flag the kernel as tainted. LACT (the most complete AMD GPU control app) is only available from the unofficial COPR 'ilyaz/LACT' or as a Flatpak, so this tool does not install it. Overdrive is not enabled; see docs/WHATDOESITDO.md."
   note "Epic Games Launcher" \
     "Epic lists a native Linux launcher (AppImage) with Fedora 43+ among supported distros at https://launcher.epicgames.com/ . Download it there yourself; this tool does not fetch binaries."
 }
