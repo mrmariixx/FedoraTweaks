@@ -1,0 +1,13 @@
+name: lint
+
+on: [push, pull_request]
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n
+        run: for f in FedoraTweaks lib/*.sh modules/*.sh; do bash -n "$f"; done
+      - name: shellcheck
+        run: shellcheck -x -s bash -S error FedoraTweaks lib/*.sh modules/*.sh
