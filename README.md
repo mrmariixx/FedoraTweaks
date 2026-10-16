@@ -66,7 +66,7 @@ On 14 Oct 2026 Epic [announced EAC Linux v2](https://onlineservices.epicgames.co
 - kexec disabled at boot
 - the BPF LSM active
 
-Epic says these requirements will change over time. `./FedoraTweaks anticheat` checks each one and can add the missing kernel arguments through `grubby` if you ask it to. **Never disable Secure Boot or TPM for performance**, and avoid custom kernels and out-of-tree modules. See [docs/PLAN.md](docs/PLAN.md#5-fortnite-and-anti-cheat-readiness).
+Epic says these requirements will change over time. `./FedoraTweaks anticheat` checks each one and can add the missing kernel arguments through `grubby` if you ask it to. **Never disable Secure Boot or TPM for performance**, and avoid custom kernels and out-of-tree modules. See [docs/WHATDOESITDO.md](docs/WHATDOESITDO.md#5-fortnite-and-anti-cheat-readiness).
 
 ## Contributing
 
