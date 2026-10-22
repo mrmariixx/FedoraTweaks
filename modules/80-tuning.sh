@@ -1,137 +1,260 @@
+
 # shellcheck shell=bash
-# Stage 8 — performance tuning. Only changes with a plausible, measurable effect are offered.
-# Everything else is explained and deliberately NOT applied.
+# Stage 8 — performance tuning.
+# Only reversible changes with a plausible, measurable effect are offered.
+# Results depend on hardware and workload; no FPS gains are guaranteed.
 
 tune_power_profile() {
-  command -v powerprofilesctl >/dev/null 2>&1 || { info "powerprofilesctl not found — skipping power profile."; return 0; }
-  local cur
-  cur=$(powerprofilesctl get 2>/dev/null)
-  if [[ $cur == performance ]]; then ok "Power profile is already 'performance'."; return 0; fi
-  [[ -z $cur ]] && { warn "Could not read the current power profile."; return 0; }
+  command -v powerprofilesctl >/dev/null 2>&1 || {
+    info "powerprofilesctl not found — skipping power profile."
+    return 0
+  }
+
+  local cur profiles
+  cur=$(powerprofilesctl get 2>/dev/null) || cur=''
+  profiles=$(powerprofilesctl list 2>/dev/null) || profiles=''
+
+  if [[ $cur == performance ]]; then
+    ok "Power profile is already 'performance'."
+    return 0
+  fi
+
+  if [[ -z $cur ]]; then
+    warn "Could not read the current power profile."
+    return 0
+  fi
+
+  if ! grep -qE '(^|[[:space:]])performance([[:space:]]|$)' <<<"$profiles"; then
+    info "The performance profile is not reported as available — skipping."
+    return 0
+  fi
+
   if propose optional "Use the 'performance' power profile (currently '$cur')" \
-      "Fedora manages power profiles with tuned-ppd. 'performance' tells amd-pstate to favour high clocks (EPP=performance) and keeps the GPU/CPU from clocking down as eagerly. Alternatively stay on 'balanced' and let GameMode raise it only while a game runs." \
-      "Higher idle power and temperatures (a few watts to tens of watts). Gains are usually small on a desktop; check 1% lows with MangoHud." \
+      "Requests the performance profile through Fedora's power-profile service. It may favour responsiveness and higher clocks, depending on the CPU, firmware and power-profile backend. GameMode can instead request performance behaviour only while a game runs." \
+      "Higher power consumption, fan noise and temperatures. FPS improvements are workload-dependent." \
       "./FedoraTweaks rollback — or: powerprofilesctl set $cur"; then
-    run powerprofilesctl set performance && journal_add "Power profile performance (was $cur)" "powerprofilesctl set $cur"
+    if run powerprofilesctl set performance; then
+      [[ $FT_DRY_RUN == 1 ]] || journal_add \
+        "Power profile performance (was $cur)" \
+        "powerprofilesctl set $cur"
+    else
+      warn "Could not switch to the performance profile."
+    fi
   fi
 }
 
 tune_zram() {
   local swp pc
-  swp=$(sysctl -n vm.swappiness 2>/dev/null); pc=$(sysctl -n vm.page-cluster 2>/dev/null)
-  if [[ ! -e /dev/zram0 ]]; then info "No zram device — skipping swap tuning."; return 0; fi
-  [[ -f /etc/sysctl.d/90-fedoratweaks-zram.conf ]] && { ok "zram sysctl tuning already applied."; return 0; }
-  if propose optional "Tune the kernel for zram swap (currently swappiness=$swp, page-cluster=$pc)" \
-      "Fedora swaps to compressed RAM (zram) by default — keep that. Because zram is fast, the kernel can be told to use it earlier (vm.swappiness=180) and to stop reading ahead 8 pages at a time (vm.page-cluster=0). This mainly helps when RAM is nearly full (game + browser + Discord); with 32 GB+ it rarely matters." \
-      "Nothing functional. If you see more stutter under memory pressure, roll back." \
-      "./FedoraTweaks rollback — values return to defaults after a reboot"; then
-    root_write /etc/sysctl.d/90-fedoratweaks-zram.conf "# FedoraTweaks: zram-friendly reclaim. Remove this file to revert (reboot).
+  swp=$(sysctl -n vm.swappiness 2>/dev/null) || swp='unknown'
+  pc=$(sysctl -n vm.page-cluster 2>/dev/null) || pc='unknown'
+
+  if [[ ! -e /dev/zram0 ]]; then
+    info "No /dev/zram0 device — skipping zram tuning."
+    return 0
+  fi
+
+  if [[ -f /etc/sysctl.d/90-fedoratweaks-zram.conf ]]; then
+    ok "zram sysctl tuning is already configured."
+    return 0
+  fi
+
+  if propose optional "Tune memory reclaim for zram (swappiness=$swp, page-cluster=$pc)" \
+      "Keeps Fedora's compressed zram swap enabled, while setting vm.swappiness=180 and vm.page-cluster=0. This may help under memory pressure by allowing earlier use of compressed swap and avoiding swap readahead. It is not a general FPS tweak." \
+      "Behaviour under memory pressure may change. If responsiveness worsens, roll back and reboot or restore the previous settings." \
+      "./FedoraTweaks rollback — or remove /etc/sysctl.d/90-fedoratweaks-zram.conf and reboot"; then
+    if root_write /etc/sysctl.d/90-fedoratweaks-zram.conf \
+        "# FedoraTweaks: optional zram-oriented memory reclaim settings.
+# Remove this file to revert; reboot or reload sysctl settings.
 vm.swappiness = 180
-vm.page-cluster = 0" "zram sysctl tuning" && sudo_run sysctl --system >/dev/null
+vm.page-cluster = 0" \
+        "zram sysctl tuning"; then
+      sudo_run sysctl --system >/dev/null || warn "Could not reload sysctl settings. The file may apply at the next boot."
+    fi
   fi
 }
 
 tune_ntsync() {
-  if [[ -e /dev/ntsync ]] && lsmod | grep -q '^ntsync'; then
-    ok "ntsync is loaded (Fedora 44+ does this by default) — Proton uses /dev/ntsync automatically."
+  if [[ -e /dev/ntsync ]]; then
+    ok "/dev/ntsync exists. No persistent module configuration is needed just because it exists."
     return 0
   fi
-  if ! modinfo ntsync >/dev/null 2>&1; then
-    info "This kernel has no ntsync module — skipping."
+
+  if ! command -v modinfo >/dev/null 2>&1 || ! modinfo ntsync >/dev/null 2>&1; then
+    info "The ntsync module is unavailable in this kernel — skipping."
     return 0
   fi
-  if [[ -e /dev/ntsync ]] && [[ -f /etc/modules-load.d/ntsync.conf ]]; then
-    ok "ntsync is loaded at boot."
+
+  if [[ -f /etc/modules-load.d/ntsync.conf ]]; then
+    info "ntsync is configured for boot, but /dev/ntsync is absent. Check the kernel log and module status."
     return 0
   fi
+
   if propose optional "Load the ntsync kernel module at boot" \
-      "ntsync implements Windows NT synchronization primitives in the kernel. Recent Proton/Wine versions use /dev/ntsync when it exists instead of esync/fsync. It can improve frame pacing in some CPU-heavy games; many games show no difference." \
-      "Nothing expected. If a Proton version misbehaves, roll this back and reboot." \
+      "ntsync provides Windows NT synchronization primitives through /dev/ntsync. Compatible Wine/Proton versions can use it when supported. Performance and compatibility effects vary by game and software version." \
+      "It may not help every game. If a game becomes less stable, remove the configuration and reboot." \
       "./FedoraTweaks rollback — or delete /etc/modules-load.d/ntsync.conf and reboot"; then
-    root_write /etc/modules-load.d/ntsync.conf "ntsync" "Load ntsync at boot" && sudo_run modprobe ntsync
-    if [[ $FT_DRY_RUN != 1 ]]; then
-      if [[ -r /dev/ntsync && -w /dev/ntsync ]]; then ok "/dev/ntsync is usable by your user."
-      else warn "/dev/ntsync exists but is not read/writable by your user ($(stat -c '%A %U:%G' /dev/ntsync 2>/dev/null)). Proton will fall back to fsync."; fi
+    if root_write /etc/modules-load.d/ntsync.conf \
+        "# FedoraTweaks: load ntsync at boot
+ntsync" "Load ntsync at boot"; then
+      if [[ $FT_DRY_RUN != 1 ]]; then
+        if sudo_run modprobe ntsync; then
+          if [[ -e /dev/ntsync ]]; then
+            ok "ntsync is loaded. Device permissions: $(stat -c '%A %U:%G' /dev/ntsync 2>/dev/null || echo unknown)."
+          else
+            warn "The module command completed, but /dev/ntsync is absent. Check 'journalctl -k'."
+          fi
+        else
+          warn "Could not load ntsync now. The boot configuration may still be present."
+        fi
+      fi
     fi
   fi
 }
 
 tune_shader_cache() {
   local f="$HOME/.config/environment.d/90-fedoratweaks-mesa.conf"
-  [[ -f $f ]] && { ok "Mesa shader cache size already configured."; return 0; }
-  if propose optional "Larger Mesa shader cache for non-Steam games (10 GB)" \
-      "Mesa caches compiled shaders so they do not recompile (stutter) next time. The default cap is about 1 GB, which large games launched outside Steam (Heroic, Lutris, Epic launcher) can exceed, causing re-compilation stutter. Steam games use Steam's own per-game shader cache and are not affected." \
-      "Up to 10 GB of disk in ~/.cache/mesa_shader_cache* (only used if games need it)." \
+
+  if [[ -f $f ]]; then
+    ok "Mesa shader-cache configuration already exists ($f) — leaving it alone."
+    return 0
+  fi
+
+  if propose optional "Increase the Mesa shader-cache limit to 10 GB" \
+      "Sets MESA_SHADER_CACHE_MAX_SIZE=10G for applications inheriting the user environment. A larger cache can reduce repeated shader compilation when the default cache limit is reached. It does not eliminate first-run shader compilation or guarantee fewer stutters." \
+      "The cache may use up to 10 GB of disk space if needed. Steam's shader pre-caching and Mesa's own cache are separate mechanisms; both may matter depending on the game." \
       "./FedoraTweaks rollback — or delete $f and log out/in"; then
-    user_write "$f" "# FedoraTweaks: allow Mesa's shader cache to grow (applies after re-login)
-MESA_SHADER_CACHE_MAX_SIZE=10G" "Mesa shader cache 10G"
+    user_write "$f" \
+      "# FedoraTweaks: increase Mesa shader-cache limit.
+# Takes effect for applications started after logging in again.
+MESA_SHADER_CACHE_MAX_SIZE=10G" \
+      "Mesa shader cache limit"
   fi
 }
 
 tune_x3d_vcache() {
   local f cur
   f=$(compgen -G '/sys/bus/platform/drivers/amd_x3d_vcache/*/amd_x3d_mode' | head -n 1)
-  [[ -n $f ]] || return 0   # only dual-CCD Ryzen X3D CPUs (e.g. 7950X3D, 9950X3D) expose this
-  cur=$(cat "$f" 2>/dev/null)
-  if [[ $cur == cache ]]; then ok "3D V-Cache mode is already 'cache'."; return 0; fi
-  if propose optional "Prefer the 3D V-Cache CCD for games (amd_x3d_mode=cache, currently '$cur')" \
-      "Your CPU has two core complexes (CCDs) and only one carries the stacked 3D V-Cache. The kernel's amd_x3d_vcache driver can make the scheduler fill the cache CCD first — what most games want — instead of the higher-clocked CCD (the default, 'frequency'). Applied now and at every boot through systemd-tmpfiles." \
-      "Some lightly-threaded productivity work runs a little slower. Phoronix benchmarks show the effect is workload-dependent: compare MangoHud logs before keeping it." \
-      "./FedoraTweaks rollback — or: echo frequency | sudo tee $f"; then
-    root_write /etc/tmpfiles.d/90-fedoratweaks-x3d.conf "# FedoraTweaks: prefer the 3D V-Cache CCD (remove this file to revert)
-w $f - - - - cache" "3D V-Cache mode 'cache' at boot" "echo $cur | sudo tee $f >/dev/null"
-    if [[ $FT_DRY_RUN != 1 ]]; then
-      echo cache | sudo tee "$f" >/dev/null && ok "amd_x3d_mode is now '$(cat "$f")'."
+
+  # This sysfs control exists only on supported dual-CCD X3D CPUs.
+  [[ -n $f && -w $f ]] || return 0
+
+  cur=$(cat "$f" 2>/dev/null) || cur=''
+  [[ -n $cur ]] || {
+    info "Could not read the AMD 3D V-Cache mode — skipping."
+    return 0
+  }
+
+  if [[ $cur == cache ]]; then
+    ok "AMD 3D V-Cache mode is already 'cache'."
+    return 0
+  fi
+
+  if propose optional "Prefer the 3D V-Cache CCD for games (currently '$cur')" \
+      "On supported dual-CCD Ryzen X3D processors, the amd_x3d_vcache driver exposes a mode that influences scheduling between cache-focused and frequency-focused CCDs. Whether 'cache' improves a workload depends on the game and kernel." \
+      "Some workloads may perform worse. Compare repeatable benchmarks before keeping this setting." \
+      "./FedoraTweaks rollback — restore '$cur' with: echo '$cur' | sudo tee '$f'"; then
+    if root_write /etc/tmpfiles.d/90-fedoratweaks-x3d.conf \
+        "# FedoraTweaks: set the supported AMD X3D mode at boot.
+# Remove this file to stop applying the setting.
+w $f - - - - cache" \
+        "AMD 3D V-Cache mode" \
+        "echo '$cur' | sudo tee '$f' >/dev/null"; then
+      if [[ $FT_DRY_RUN != 1 ]]; then
+        if printf '%s\n' cache | sudo tee "$f" >/dev/null; then
+          ok "AMD X3D mode is now '$(cat "$f" 2>/dev/null || echo unknown)'."
+        else
+          warn "Could not change the AMD X3D mode immediately; check the sysfs control."
+        fi
+      fi
     fi
   fi
 }
 
 tune_writeback() {
   local f=/etc/sysctl.d/90-fedoratweaks-writeback.conf memg
-  [[ -f $f ]] && { ok "Write-back limits already applied."; return 0; }
+  [[ -f $f ]] && {
+    ok "Write-back limits are already configured."
+    return 0
+  }
+
   memg=$(awk '/^MemTotal:/ { printf "%d", $2 / 1048576 }' /proc/meminfo)
-  if propose optional "Smaller disk write-back bursts (vm.dirty_bytes = 256 MB)" \
-      "By default Linux lets up to 20% of RAM (≈ $(( memg * 20 / 100 )) GB here) of unwritten data pile up and then flushes it in one burst. Big Steam downloads, game installs or shader-cache writes in the background can then cause a hitch in the game you are playing. Capping dirty data at 256 MB (background flushing from 64 MB) keeps writes small and steady." \
-      "Slightly lower peak speed for very large file copies. No effect when nothing is being written." \
-      "./FedoraTweaks rollback — values return to the defaults after a reboot"; then
-    root_write "$f" "# FedoraTweaks: small, steady write-back instead of multi-GB bursts. Remove to revert (reboot).
+  [[ $memg =~ ^[0-9]+$ ]] || memg=0
+
+  if propose optional "Limit dirty-data bursts (vm.dirty_bytes = 256 MiB)" \
+      "Linux normally allows a percentage of RAM to hold dirty, unwritten data before throttling and flushing. A fixed 256 MiB dirty-data limit and 64 MiB background threshold may reduce large write bursts during installs or downloads. Results depend on storage speed and workload." \
+      "May reduce peak throughput for large writes or copies. It is not expected to improve FPS when the system is idle." \
+      "./FedoraTweaks rollback — remove $f and reboot or reload sysctl settings"; then
+    if root_write "$f" \
+        "# FedoraTweaks: optional dirty-data write-back limits.
+# Remove this file to revert to the kernel defaults.
 vm.dirty_bytes = 268435456
-vm.dirty_background_bytes = 67108864" "Write-back limits" && sudo_run sysctl --system >/dev/null
+vm.dirty_background_bytes = 67108864" \
+        "Write-back limits"; then
+      sudo_run sysctl --system >/dev/null || warn "Could not reload sysctl settings. The file may apply at the next boot."
+    fi
   fi
 }
 
 tune_pipewire_latency() {
-  command -v pw-metadata >/dev/null 2>&1 || return 0
+  command -v pw-metadata >/dev/null 2>&1 || {
+    info "PipeWire tools are unavailable — skipping audio latency tuning."
+    return 0
+  }
+
   local f="$HOME/.config/pipewire/pipewire.conf.d/90-fedoratweaks-lowlatency.conf"
-  [[ -f $f ]] && { ok "PipeWire low-latency config already present."; return 0; }
-  if propose optional "Lower default audio latency (PipeWire quantum 256 ≈ 5 ms)" \
-      "When an app does not request its own buffer size, PipeWire uses 1024 samples (≈ 21 ms at 48 kHz). Lowering the default to 256 (≈ 5 ms) makes game sounds and voice chat react sooner. Try it first without changing files: 'pw-metadata -n settings 0 clock.force-quantum 256' (reset with 0) and watch 'pw-top' for xruns." \
-      "A little more CPU wake-up overhead; on some sound hardware crackling — then roll back or use 512." \
-      "./FedoraTweaks rollback, then: systemctl --user restart pipewire pipewire-pulse wireplumber"; then
-    user_write "$f" "# FedoraTweaks: lower default PipeWire buffer (delete this file to revert)
+
+  [[ -f $f ]] && {
+    ok "PipeWire latency configuration already exists ($f) — leaving it alone."
+    return 0
+  }
+
+  if propose optional "Lower PipeWire's default quantum to 256 samples" \
+      "Sets the default clock quantum to 256 samples, with a minimum of 32 and maximum of 2048. At 48 kHz, 256 samples represent about 5.3 ms per quantum, not the complete end-to-end audio latency. Applications can request different buffer sizes." \
+      "More frequent audio processing can increase CPU wake-ups and cause crackling on some hardware. Test voice chat and games; use 512 samples if 256 is unstable." \
+      "./FedoraTweaks rollback — remove $f, then restart the user PipeWire services"; then
+    if user_write "$f" \
+        "# FedoraTweaks: optional PipeWire clock quantum settings.
+# Remove this file to revert.
 context.properties = {
     default.clock.quantum     = 256
     default.clock.min-quantum = 32
     default.clock.max-quantum = 2048
-}" "PipeWire default quantum 256" && run systemctl --user restart pipewire pipewire-pulse wireplumber
+}" \
+        "PipeWire default quantum"; then
+      if [[ $FT_DRY_RUN != 1 ]]; then
+        systemctl --user restart pipewire pipewire-pulse wireplumber ||
+          warn "Could not restart every PipeWire user service. Log out/in to apply the configuration."
+      fi
+    fi
   fi
 }
 
 report_kernel_defaults() {
-  local mmc
-  mmc=$(sysctl -n vm.max_map_count 2>/dev/null)
-  if [[ -n $mmc ]] && (( mmc >= 1048576 )); then
-    ok "vm.max_map_count=$mmc (Fedora's gaming-friendly default; nothing to change)."
+  local mmc driver pstate
+  mmc=$(sysctl -n vm.max_map_count 2>/dev/null) || mmc=''
+  if [[ $mmc =~ ^[0-9]+$ ]] && (( mmc >= 1048576 )); then
+    ok "vm.max_map_count=$mmc."
+  elif [[ $mmc =~ ^[0-9]+$ ]]; then
+    warn "vm.max_map_count=$mmc is below 1048576. Some games may need a higher limit; inspect /usr/lib/sysctl.d/ before changing it."
   else
-    warn "vm.max_map_count=$mmc is below 1048576; some games (e.g. via Proton) need more. Fedora normally sets this — check /usr/lib/sysctl.d/."
+    info "Could not read vm.max_map_count."
   fi
-  ok "CPU frequency driver: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver 2>/dev/null || echo unknown), amd_pstate: $(cat /sys/devices/system/cpu/amd_pstate/status 2>/dev/null || echo n/a). Nothing to change — this is the recommended driver."
-  systemctl is-active --quiet systemd-oomd && ok "systemd-oomd is active (keeps the desktop responsive under memory pressure)."
+
+  driver=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver 2>/dev/null || echo unknown)
+  pstate=$(cat /sys/devices/system/cpu/amd_pstate/status 2>/dev/null || echo n/a)
+  ok "CPU frequency driver: $driver; amd_pstate status: $pstate. No automatic change applied."
+
+  if systemctl is-active --quiet systemd-oomd; then
+    ok "systemd-oomd is active."
+  else
+    info "systemd-oomd is not active; no change applied."
+  fi
 }
 
 stage_tuning() {
   header "Stage 8 — Performance tuning"
-  explain "These are optional and measurable. Apply one, reboot if needed, measure with MangoHud ('./FedoraTweaks bench'), and keep it only if it helps on your hardware."
+  explain "These options are experimental or workload-dependent. Apply one at a time, reboot or log out if required, then compare repeatable MangoHud benchmarks. Keep only changes that show a consistent benefit."
+
   report_kernel_defaults
   tune_power_profile
   tune_zram
@@ -143,22 +266,23 @@ stage_tuning() {
 
   local scx_repo
   scx_repo=$(dnf repoquery --available --qf '%{repoid}\n' scx-scheds 2>/dev/null | head -n 1)
-  note "sched-ext schedulers (scx_lavd, scx_bpfland …)" \
+
+  note "sched-ext schedulers (scx_lavd, scx_bpfland, etc.)" \
     "$( if [[ $scx_repo == fedora || $scx_repo == updates ]]; then
-          echo "scx-scheds is available from Fedora's '$scx_repo' repository."
+          echo "scx-scheds appears available from Fedora's '$scx_repo' repository. Availability and supported schedulers depend on the Fedora release and kernel."
         else
-          echo "scx-scheds is not in Fedora's enabled repositories on this system (third-party COPRs exist; not used here)."
-        fi ) Test without installing a service: run e.g. 'sudo scx_lavd' in a terminal, play, and press Ctrl+C to return to the default scheduler instantly. Keep one only if MangoHud logs show better 1% lows across several runs. Interaction with EAC Linux v2 is unknown."
+          echo "scx-scheds was not found in the enabled Fedora repositories. No third-party repository will be added automatically."
+        fi ) Test schedulers only if you understand how to return to the default scheduler. Compare several repeatable runs; there is no universally best scheduler for games."
 
   note "Not applied — and why" \
-    "• mitigations=off: disables CPU security mitigations; modern Zen CPUs gain little and you lose protection. Do not use.
-• Disabling split-lock detection (kernel.split_lock_mitigate=0): only helps specific games that trigger split locks (you would see 'split lock detection' in 'journalctl -k'). Apply manually only for such a game.
-• amdgpu.ppfeaturemask / forcing power_dpm_force_performance_level=high: unlocks overclocking/fan control or pins clocks; raises heat and power, can cause instability, and recent kernels may flag the system as tainted. Not a general speed-up.
-• Custom kernels (CachyOS, Zen, XanMod): not signed with Fedora's key, so they break Secure Boot and EAC Linux v2. Fedora's kernel already has a current scheduler (EEVDF), amd-pstate and the latest amdgpu.
-• iommu=pt: conflicts with EAC Linux v2 and brings no gaming benefit.
-• kernel.nmi_watchdog=0 / nowatchdog: removes a periodic NMI and frees one CPU performance counter; the effect on games is below measurement noise.
-• Transparent hugepages 'always': no consistent gaming gain and can add latency spikes from memory compaction. Fedora's 'madvise' default lets programs that benefit opt in.
-• TCP BBR / qdisc changes: affect bulk download throughput, not in-game ping.
-• noatime: Fedora already uses relatime on Btrfs/SSD; the difference is negligible.
-• 'Gaming' sysctl bundles, I/O scheduler swaps, disabling journald/SELinux/firewalld, disabling zram: placebo or harmful."
+    "• mitigations=off: disables CPU security protections for a workload-dependent performance effect. Not recommended.
+• Disabling split-lock detection: can affect system behaviour and is relevant only to specific workloads; inspect kernel logs before considering it.
+• amdgpu.ppfeaturemask, forced GPU clocks and power limits: can increase heat and power, reduce stability and require hardware-specific testing.
+• Custom kernels: can complicate Secure Boot, maintenance and troubleshooting. No claim is made that every custom kernel necessarily breaks game anti-cheat.
+• iommu=pt: not a general gaming-performance tweak. No blanket compatibility claim about EAC is made here.
+• kernel.nmi_watchdog=0 / nowatchdog: removes monitoring functionality for a benefit that is usually difficult to measure in games.
+• Transparent hugepages 'always': has no consistent gaming benefit and may introduce memory-compaction overhead.
+• TCP BBR or qdisc changes: mainly affect network throughput and queueing; they do not automatically lower game-server ping.
+• noatime: Fedora's common Btrfs setup already uses relatime; expected benefit is negligible.
+• Generic gaming sysctl bundles, arbitrary I/O scheduler changes, disabling SELinux/firewalld/journald or disabling zram: can reduce security, reliability or responsiveness without a reliable FPS gain."
 }

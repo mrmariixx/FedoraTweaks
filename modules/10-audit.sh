@@ -1,4 +1,4 @@
-# shellcheck shell=bash
+ # shellcheck shell=bash
 # Stage 1 — read-only audit. Changes nothing; writes a plain-text report you can share.
 
 audit_section() {
@@ -97,6 +97,52 @@ audit_body() {
   ro 'echo "TPM version: $(cat /sys/class/tpm/tpm0/tpm_version_major 2>/dev/null || echo none)"'
   ro 'cat /proc/cmdline'
 
+
+  audit_section "Audio stack" \
+    "PipeWire, WirePlumber, PulseAudio compatibility and active audio devices."
+  ro 'printf "PipeWire: "; command -v pipewire || true; printf "WirePlumber: "; command -v wireplumber || true'
+  ro 'systemctl --user is-active pipewire.service pipewire-pulse.service wireplumber.service 2>&1'
+  ro 'wpctl status 2>/dev/null | head -n 45 || pactl info 2>/dev/null'
+  ro 'rpm -q pipewire pipewire-pulseaudio wireplumber alsa-sof-firmware 2>&1'
+
+  audit_section "Network and connectivity" \
+    "NetworkManager, active interfaces, Wi-Fi state, DNS and connection status."
+  ro 'nmcli general status 2>&1'
+  ro 'nmcli device status 2>&1'
+  ro 'ip -brief address 2>/dev/null'
+  ro 'ip route show default 2>/dev/null'
+  ro 'resolvectl status 2>/dev/null | head -n 35'
+  ro 'systemctl is-active NetworkManager systemd-resolved 2>&1'
+
+  audit_section "Thermals and cooling" \
+    "Available CPU/GPU temperature sensors, fan readings and thermal throttling indicators."
+  ro 'for f in /sys/class/thermal/thermal_zone*/; do [ -r "${f}temp" ] || continue; printf "%s: " "${f%/}"; cat "${f}type" 2>/dev/null | tr "\n" " "; awk "{printf \"%.1f C\n\", \$1/1000}" "${f}temp"; done'
+  ro 'for f in /sys/class/hwmon/hwmon*/; do [ -r "${f}name" ] || continue; printf "%s: " "${f}name"; cat "${f}name"; for t in "${f}"temp*_input; do [ -r "$t" ] || continue; printf "  %s: " "${t##*/}"; awk "{printf \"%.1f C\n\", \$1/1000}" "$t"; done; done'
+  ro 'journalctl -k -b --no-pager -o cat 2>/dev/null | grep -iE "thermal throttling|temperature above threshold|amdgpu.*(throttl|overheat)" | tail -n 15 || true'
+
+  audit_section "Disk health and I/O" \
+    "Filesystem capacity, inode usage, NVMe/SATA devices and recent storage errors."
+  ro 'df -hT'
+  ro 'df -ih'
+  ro 'command -v nvme >/dev/null && sudo nvme list 2>&1 || echo "nvme-cli unavailable"'
+  ro 'journalctl -k -b --no-pager -o cat 2>/dev/null | grep -iE "I/O error|nvme.*(timeout|reset|error)|ata.*error|EXT4-fs error|BTRFS.*error" | tail -n 20 || true'
+  ro 'systemctl is-active fstrim.timer 2>&1'
+
+  audit_section "Gaming and graphics stack" \
+    "Steam availability, game-related libraries, GameMode, Gamescope and Vulkan diagnostics."
+  ro 'rpm -q steam gamemode gamescope mangohud goverlay 2>&1'
+  ro 'rpm -q glibc.i686 libgcc.i686 libstdc++.i686 2>&1'
+  ro 'command -v gamemoded >/dev/null && gamemoded -t 2>&1 || echo "GameMode daemon/test unavailable"'
+  ro 'command -v gamescope || echo "Gamescope not installed"'
+  ro 'command -v glxinfo >/dev/null && glxinfo -B 2>&1 | grep -E "OpenGL vendor|OpenGL renderer|OpenGL core profile version" || true'
+  ro 'command -v vulkaninfo >/dev/null && timeout 10s vulkaninfo --summary 2>&1 | head -n 45 || echo "Vulkan diagnostic unavailable or timed out"'
+
+  audit_section "Recent system warnings" \
+    "Recent warnings and errors from this boot that may explain crashes, slowdowns or driver problems."
+  ro 'journalctl -p warning..alert -b --no-pager -o short-monotonic 2>/dev/null | tail -n 40'
+  ro 'journalctl --user -p warning..alert -b --no-pager -o short-monotonic 2>/dev/null | tail -n 25'
+  ro 'systemctl --failed --no-legend --no-pager'
+
   audit_section "Quick observations" "automatic hints from the data above. Nothing is changed."
   audit_observations
 }
@@ -136,3 +182,4 @@ stage_audit() {
   ok "Audit report saved: $report"
   explain "Share this file when asking for system-specific advice. It contains hardware and package details but no passwords or personal files."
 }
+

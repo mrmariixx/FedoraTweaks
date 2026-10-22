@@ -1,150 +1,352 @@
+
 #!/usr/bin/env bash
 # FedoraTweaks — staged, reversible debloat and AMD gaming setup for Fedora KDE Plasma.
-# Run it as your normal user:   ./FedoraTweaks
+# Run as a normal user: ./FedoraTweaks
 # License: MIT (see LICENSE)
 
 set -uo pipefail
 
-FT_ROOT="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)"
+# Resolve the project directory independently of the current working directory.
+FT_ROOT="$(
+  cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" &&
+    pwd
+)" || {
+  printf 'FedoraTweaks: could not determine the project directory.\n' >&2
+  exit 1
+}
+
+# Load common helpers before any stage modules.
+if [[ ! -r "$FT_ROOT/lib/common.sh" ]]; then
+  printf 'FedoraTweaks: required file is missing: %s\n' \
+    "$FT_ROOT/lib/common.sh" >&2
+  exit 1
+fi
+
 # shellcheck source=lib/common.sh
-source "$FT_ROOT/lib/common.sh"
-for _ft_mod in "$FT_ROOT"/modules/*.sh; do
+if ! source "$FT_ROOT/lib/common.sh"; then
+  printf 'FedoraTweaks: failed to load lib/common.sh\n' >&2
+  exit 1
+fi
+
+: "${FT_DRY_RUN:=0}"
+
+# Load stage modules in a predictable order.
+# Missing module files are an error, not a reason to silently skip features.
+_ft_modules=()
+while IFS= read -r -d '' _ft_module; do
+  _ft_modules+=("$_ft_module")
+done < <(
+  find "$FT_ROOT/modules" -maxdepth 1 -type f -name '*.sh' -print0 2>/dev/null |
+    sort -z
+)
+
+if (( ${#_ft_modules[@]} == 0 )); then
+  die "No stage modules found in $FT_ROOT/modules."
+fi
+
+for _ft_module in "${_ft_modules[@]}"; do
+  if [[ ! -r $_ft_module ]]; then
+    die "Cannot read stage module: $_ft_module"
+  fi
+
   # shellcheck disable=SC1090
-  source "$_ft_mod"
+  if ! source "$_ft_module"; then
+    die "Failed to load stage module: ${_ft_module##*/}"
+  fi
 done
-unset _ft_mod
+
+unset _ft_modules _ft_module
 
 usage() {
   cat <<EOF
-FedoraTweaks $FT_VERSION — debloat + AMD gaming setup for Fedora KDE Plasma
+FedoraTweaks $FT_VERSION — Fedora KDE debloat and AMD gaming setup
 
-Usage: ./FedoraTweaks [options] [command]
+Usage:
+  ./FedoraTweaks [options] [command]
 
-With no command, the guided setup starts: audit → baseline → each stage in order.
-Nothing is changed without asking you first, and every change can be rolled back.
+With no command, the welcome screen opens.
+The default guided setup audits the system, records a baseline, and offers
+each stage in order. Changes require confirmation where applicable.
 
 Commands:
-  guided      Guided setup (default)
-  menu        Pick individual stages from a menu
-  audit       Read-only system audit, saved as a shareable report
-  baseline    Record idle RAM/CPU, processes, services, boot time, temps
-  compare     Compare two baselines (before/after)
+  guided      Run the guided setup
+  menu        Open the interactive stage menu
+  audit       Run the read-only system audit
+  baseline    Record system metrics
+  compare     Compare two recorded baselines
   updates     Stage 3: Fedora, kernel, Mesa and firmware updates
-  services    Stage 4: disable unneeded services and timers
-  packages    Stage 5: remove unneeded Fedora/KDE packages
-  kde         Stage 6: lighter KDE Plasma configuration
-  gaming      Stage 7: Vulkan 32-bit, GameMode, MangoHud, RPM Fusion, Steam
-  tuning      Stage 8: optional, measurable performance tuning
-  anticheat   Stage 9: Fortnite / EAC Linux v2 readiness check
-  status      List applied changes
-  rollback    Undo applied changes
-  bench FILE  Summarise MangoHud CSV logs (avg FPS, 1%/0.1% lows, frametime)
+  services    Stage 4: services and timers
+  packages    Stage 5: optional package removal
+  kde         Stage 6: KDE Plasma configuration
+  gaming      Stage 7: AMD gaming stack, Vulkan, GameMode and MangoHud
+  tuning      Stage 8: optional performance tuning
+  anticheat   Stage 9: Fortnite / EAC readiness checks
+  status      List recorded changes awaiting rollback
+  rollback    Review and undo recorded changes
+  bench FILE  Analyse a MangoHud CSV benchmark
 
 Options:
-  -n, --dry-run   Print state-changing commands instead of running them
+  -n, --dry-run   Print or simulate changes without applying them
   -h, --help      Show this help
   -V, --version   Show version
+  --              End option parsing
 
-State, reports, backups and the change journal live in:
+Examples:
+  ./FedoraTweaks
+  ./FedoraTweaks --dry-run guided
+  ./FedoraTweaks audit
+  ./FedoraTweaks baseline
+  ./FedoraTweaks bench ~/mangohud.csv
+  ./FedoraTweaks rollback
+
+State, reports, backups and the change journal:
   $FT_STATE_DIR
+
 EOF
 }
 
-guided_stage() { # NAME FUNCTION
+# Run a stage without letting an ordinary stage failure terminate the menu.
+# Do not globally enable 'set -e': modules intentionally handle some failures.
+run_stage() {
+  local label=$1
+  local function_name=$2
+
+  if ! declare -F "$function_name" >/dev/null 2>&1; then
+    err "Stage '$label' is unavailable: function $function_name was not loaded."
+    return 1
+  fi
+
   printf '\n'
-  if confirm "${C_BOLD}Open stage: $1?${C_RESET}" y; then "$2"; else info "Skipped: $1"; fi
+
+  if "$function_name"; then
+    return 0
+  else
+    local rc=$?
+    err "Stage '$label' returned an error (exit status $rc)."
+    return "$rc"
+  fi
+}
+
+guided_stage() {
+  local label=$1
+  local function_name=$2
+
+  printf '\n'
+
+  if confirm "${C_BOLD:-}Open stage: $label?${C_RESET:-}" y; then
+    run_stage "$label" "$function_name"
+  else
+    info "Skipped: $label"
+    return 0
+  fi
 }
 
 guided() {
   header "Guided setup"
-  explain "Order matters: 1) inspect, 2) record a baseline, then one group of changes at a time. Re-run './FedoraTweaks baseline' after a reboot and './FedoraTweaks compare' to see what actually changed. You can stop at any prompt with Ctrl+C — everything already applied stays recorded for rollback."
 
-  guided_stage "Audit (read-only)" stage_audit
-  if have_baseline; then
-    ok "A baseline already exists ($(ls "$FT_BASELINE_DIR" | tail -n 1))."
-    confirm "Record another one now?" n && stage_baseline
-  else
-    warn "No baseline yet. Measure BEFORE changing anything, otherwise you cannot tell what helped."
-    if confirm "Record the baseline now?" y; then
-      stage_baseline
-    elif ! confirm "Continue to the change stages without a baseline?" n; then
-      info "Stopped. Reboot, then run './FedoraTweaks' again."
+  explain "Recommended order: inspect the system, record a baseline, then apply changes one stage at a time. After rebooting, record another baseline and compare the results. You can stop at any prompt; completed changes remain recorded for rollback."
+
+  local failed=0
+  local baseline_count=0
+  local baseline_name=''
+
+  if ! run_stage "Audit" stage_audit; then
+    warn "The audit reported an error. Review its output before continuing."
+    if ! confirm "Continue with the guided setup?" n; then
+      info "Guided setup stopped."
       return 0
     fi
   fi
 
-  guided_stage "Updates" stage_updates
-  guided_stage "Services" stage_services
-  guided_stage "Package debloat" stage_packages
-  guided_stage "KDE Plasma" stage_kde
-  guided_stage "Gaming stack" stage_gaming
-  guided_stage "Performance tuning" stage_tuning
-  guided_stage "Fortnite / EAC Linux v2 readiness" stage_anticheat
+  if have_baseline; then
+    baseline_name=$(find "$FT_BASELINE_DIR" -mindepth 2 -maxdepth 2 \
+      -type f -name metrics.env -printf '%T@ %p\n' 2>/dev/null |
+      sort -nr | head -n 1 | cut -d' ' -f2-)
 
-  header "Done"
-  stage_status
-  explain "Next: reboot, log in, wait two minutes, run './FedoraTweaks baseline' and then './FedoraTweaks compare'. For games, record MangoHud logs (Shift_L+F2) before and after and run './FedoraTweaks bench <log.csv>'."
+    if [[ -n $baseline_name ]]; then
+      ok "An existing baseline was found: $baseline_name"
+    else
+      ok "Existing baseline data was found."
+    fi
+
+    if confirm "Record another baseline now?" n; then
+      run_stage "Baseline" stage_baseline || failed=1
+    fi
+  else
+    warn "No baseline exists. Measuring before changes makes it easier to tell whether the tuning helped."
+
+    if confirm "Record a baseline now?" y; then
+      run_stage "Baseline" stage_baseline || failed=1
+    elif confirm "Continue without a baseline?" n; then
+      info "Guided setup stopped. You can record a baseline and restart later."
+      return 0
+    else
+      info "Guided setup stopped."
+      return 0
+    fi
+  fi
+
+  guided_stage "Updates" stage_updates || failed=1
+  guided_stage "Services" stage_services || failed=1
+  guided_stage "Package debloat" stage_packages || failed=1
+  guided_stage "KDE Plasma" stage_kde || failed=1
+  guided_stage "Gaming stack" stage_gaming || failed=1
+  guided_stage "Performance tuning" stage_tuning || failed=1
+  guided_stage "Fortnite / EAC readiness" stage_anticheat || failed=1
+
+  header "Guided setup finished"
+
+  run_stage "Status" stage_status || failed=1
+
+  explain "For a useful comparison, reboot if required, log in, let the system settle, then run './FedoraTweaks baseline' and './FedoraTweaks compare'. For games, keep the resolution and settings consistent and compare several MangoHud logs."
+
+  if (( failed )); then
+    warn "One or more stages returned errors. Review their output and the change journal before continuing."
+    return 1
+  fi
+
+  ok "All selected stages have finished."
 }
 
 menu() {
   local choice
+
   while true; do
     header "FedoraTweaks menu"
+
     cat <<'EOF'
    1) Audit (read-only)            7) Gaming stack
    2) Record baseline              8) Performance tuning
-   3) Updates & firmware           9) Fortnite / EAC v2 readiness
-   4) Services & timers           10) Compare baselines
+   3) Updates & firmware           9) Fortnite / EAC readiness
+   4) Services & timers            10) Compare baselines
    5) Package debloat              s) Status of applied changes
    6) KDE Plasma                   r) Rollback
    g) Guided setup                 q) Quit
 EOF
-    read -r -p "Choice: " choice </dev/tty || return 0
-    case $choice in
-      1) stage_audit ;;      2) stage_baseline ;;   3) stage_updates ;;
-      4) stage_services ;;   5) stage_packages ;;   6) stage_kde ;;
-      7) stage_gaming ;;     8) stage_tuning ;;     9) stage_anticheat ;;
-      10) stage_compare ;;   s) stage_status ;;     r) stage_rollback ;;
-      g) guided ;;           q|'') return 0 ;;
-      *) warn "Unknown choice: $choice" ;;
+
+    if [[ ! -r /dev/tty ]]; then
+      err "No controlling terminal is available; the interactive menu cannot run."
+      return 1
+    fi
+
+    if ! IFS= read -r -p "Choice: " choice </dev/tty; then
+      info "Leaving the menu."
+      return 0
+    fi
+
+    case ${choice,,} in
+      1)  run_stage "Audit" stage_audit ;;
+      2)  run_stage "Baseline" stage_baseline ;;
+      3)  run_stage "Updates" stage_updates ;;
+      4)  run_stage "Services" stage_services ;;
+      5)  run_stage "Packages" stage_packages ;;
+      6)  run_stage "KDE" stage_kde ;;
+      7)  run_stage "Gaming" stage_gaming ;;
+      8)  run_stage "Tuning" stage_tuning ;;
+      9)  run_stage "Anti-cheat readiness" stage_anticheat ;;
+      10) run_stage "Compare" stage_compare ;;
+      s)  run_stage "Status" stage_status ;;
+      r)  run_stage "Rollback" stage_rollback ;;
+      g)  guided ;;
+      q|'') return 0 ;;
+      *)  warn "Unknown choice: $choice" ;;
     esac
   done
 }
 
 welcome() {
-  printf '%s' "$C_BOLD"
+  printf '%s' "${C_BOLD:-}"
   printf '\n  ══ FedoraTweaks %s ══  Fedora KDE debloat + AMD gaming\n\n' "$FT_VERSION"
-  printf '%s' "$C_RESET"
-  explain "System: $FT_OS_PRETTY, kernel $(uname -r)"
-  explain "Rules: nothing changes without your 'yes'; every change is labelled SAFE / OPTIONAL / EXPERIMENTAL, explains what you lose, is backed up and journaled, and can be undone with './FedoraTweaks rollback'."
-  echo
-  local ans
-  read -r -p "Press Enter for the guided setup, 'm' for the menu, 'q' to quit: " ans </dev/tty || exit 0
-  case ${ans,,} in
+  printf '%s' "${C_RESET:-}"
+
+  explain "System: ${FT_OS_PRETTY:-unknown}, kernel $(uname -r)"
+  explain "Nothing should change without the relevant confirmation. Stages explain their effects and risks; reversible changes should be backed up and recorded in the journal."
+  printf '\n'
+
+  if [[ ! -r /dev/tty ]]; then
+    err "No controlling terminal is available. Use a direct command such as './FedoraTweaks audit'."
+    return 1
+  fi
+
+  local answer
+  if ! IFS= read -r -p "Press Enter for guided setup, 'm' for menu, 'q' to quit: " \
+      answer </dev/tty; then
+    info "No input received; exiting."
+    return 0
+  fi
+
+  case ${answer,,} in
     m) menu ;;
-    q) exit 0 ;;
+    q) return 0 ;;
     *) guided ;;
   esac
 }
 
 main() {
   local cmd=''
+  local end_options=0
+  local arg
   local -a args=()
+
   while (( $# )); do
-    case $1 in
-      -n|--dry-run) FT_DRY_RUN=1 ;;
-      -h|--help)    usage; exit 0 ;;
-      -V|--version) echo "FedoraTweaks $FT_VERSION"; exit 0 ;;
-      -*)           die "Unknown option: $1 (see --help)" ;;
-      *)            if [[ -z $cmd ]]; then cmd=$1; else args+=("$1"); fi ;;
-    esac
+    arg=$1
     shift
+
+    if (( ! end_options )); then
+      case $arg in
+        --)
+          end_options=1
+          continue
+          ;;
+        -n|--dry-run)
+          FT_DRY_RUN=1
+          continue
+          ;;
+        -h|--help)
+          usage
+          return 0
+          ;;
+        -V|--version)
+          printf 'FedoraTweaks %s\n' "$FT_VERSION"
+          return 0
+          ;;
+        -*)
+          die "Unknown option: $arg (see --help)"
+          ;;
+      esac
+    fi
+
+    if [[ -z $cmd ]]; then
+      cmd=$arg
+    else
+      args+=("$arg")
+    fi
   done
 
-  # 'bench' only parses CSV files, so it works on any Linux system.
-  if [[ $cmd == bench ]]; then bench_mangohud "${args[@]}"; exit; fi
+  # Benchmark parsing is read-only and independent of Fedora.
+  # It intentionally bypasses the Fedora preflight.
+  if [[ $cmd == bench ]]; then
+    if (( ${#args[@]} != 1 )); then
+      die "Usage: ./FedoraTweaks bench FILE"
+    fi
 
-  preflight
+    if [[ ! -f ${args[0]} || ! -r ${args[0]} ]]; then
+      die "Benchmark file does not exist or is not readable: ${args[0]}"
+    fi
+
+    if ! declare -F bench_mangohud >/dev/null 2>&1; then
+      die "The MangoHud benchmark parser was not loaded."
+    fi
+
+    bench_mangohud "${args[0]}"
+    return $?
+  fi
+
+  # Validate the platform before invoking any system-changing stage.
+  if ! preflight; then
+    return 1
+  fi
+
   case ${cmd:-start} in
     start)     welcome ;;
     guided)    guided ;;
@@ -161,7 +363,9 @@ main() {
     anticheat) stage_anticheat ;;
     status)    stage_status ;;
     rollback)  stage_rollback ;;
-    *)         die "Unknown command: $cmd (see --help)" ;;
+    *)
+      die "Unknown command: $cmd (see --help)"
+      ;;
   esac
 }
 

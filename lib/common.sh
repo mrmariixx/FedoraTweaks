@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # Shared helpers for FedoraTweaks. Sourced by ./FedoraTweaks — never executed directly.
 
-FT_VERSION="0.2.0"
+FT_VERSION="0.3.0"
 FT_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/fedoratweaks"
 FT_JOURNAL="$FT_STATE_DIR/journal.tsv"
 FT_BACKUP_DIR="$FT_STATE_DIR/backups"
@@ -166,8 +166,10 @@ journal_mark_undone() { printf 'UNDONE\t%s\n' "$1" >>"$FT_JOURNAL"; }
 backup_file() {
   local src=$1 use_sudo=${2:-} dest
   [[ -e $src ]] || return 0
-  dest="$FT_BACKUP_DIR/$(date +%Y%m%d-%H%M%S)$src"
+  # Nanoseconds avoid overwriting a backup if the same file changes twice quickly.
+  dest="$FT_BACKUP_DIR/$(date +%Y%m%d-%H%M%S%N)$src"
   mkdir -p "$(dirname "$dest")" || return 1
+  [[ -e $dest ]] && dest="${dest}.$$.$RANDOM"
   if [[ -n $use_sudo ]]; then
     sudo cp --preserve=mode,timestamps "$src" "$dest" && sudo chown "$(id -u):$(id -g)" "$dest"
   else
@@ -309,31 +311,91 @@ units_relevant() {
 # svc_off disable|mask DESCRIPTION UNIT... — stop units and keep them from starting, journaled.
 # "mask" is needed for units that D-Bus or sockets would otherwise start on demand.
 svc_off() {
-  local mode=$1 desc=$2; shift 2
-  local u st undo
+  local mode=$1 desc=$2
+  shift 2
+  local u st active=0 undo quoted_u
+  [[ $mode == disable || $mode == mask ]] || {
+    err "svc_off: unsupported mode '$mode' (expected disable or mask)."
+    return 2
+  }
+
   for u in "$@"; do
     unit_exists "$u" || continue
     st=$(unit_enabled_state "$u")
-    [[ $st == masked ]] && continue
+    [[ -n $st ]] || st=unknown
+    [[ $st == masked || $st == masked-runtime ]] && continue
+
+    active=0
+    unit_active "$u" && active=1
+    quoted_u=$(printf '%q' "$u")
+    undo=''
+
     if [[ $mode == mask ]]; then
-      if [[ $st == enabled ]]; then
-        sudo_run systemctl disable --now "$u" || continue
-        undo="sudo systemctl unmask $u && sudo systemctl enable --now $u"
-      else
-        sudo_run systemctl stop "$u"
-        undo="sudo systemctl unmask $u"
+      # Restore the original enablement and active state, not just "unmask".
+      if [[ $st == enabled || $st == enabled-runtime ]]; then
+        sudo_run systemctl disable --now "$u" || {
+          warn "Could not disable $u; leaving it unchanged."
+          continue
+        }
+      elif (( active )); then
+        sudo_run systemctl stop "$u" || {
+          warn "Could not stop $u; leaving it unchanged."
+          continue
+        }
       fi
-      sudo_run systemctl mask "$u" || continue
-    else
-      if [[ $st == enabled ]]; then
-        sudo_run systemctl disable --now "$u" || continue
-        undo="sudo systemctl enable --now $u"
-      else
-        unit_active "$u" && sudo_run systemctl stop "$u"
+
+      sudo_run systemctl mask "$u" || {
+        warn "Could not mask $u; attempting to restore its previous state."
+        if [[ $st == enabled ]]; then sudo_run systemctl enable "$u" || true; fi
+        if [[ $st == enabled-runtime ]]; then sudo_run systemctl enable --runtime "$u" || true; fi
+        (( active )) && sudo_run systemctl start "$u" || true
         continue
-      fi
+      }
+
+      undo="sudo systemctl unmask $quoted_u"
+      case $st in
+        enabled)         undo+=" && sudo systemctl enable $quoted_u" ;;
+        enabled-runtime) undo+=" && sudo systemctl enable --runtime $quoted_u" ;;
+      esac
+      (( active )) && undo+=" && sudo systemctl start $quoted_u"
+
+    else
+      case $st in
+        enabled)
+          sudo_run systemctl disable --now "$u" || {
+            warn "Could not disable $u; leaving it unchanged."
+            continue
+          }
+          undo="sudo systemctl enable $quoted_u"
+          (( active )) && undo+=" && sudo systemctl start $quoted_u"
+          ;;
+        enabled-runtime)
+          sudo_run systemctl disable --runtime --now "$u" || {
+            warn "Could not disable runtime unit $u; leaving it unchanged."
+            continue
+          }
+          undo="sudo systemctl enable --runtime $quoted_u"
+          (( active )) && undo+=" && sudo systemctl start $quoted_u"
+          ;;
+        *)
+          if (( active )); then
+            sudo_run systemctl stop "$u" || {
+              warn "Could not stop $u; leaving it unchanged."
+              continue
+            }
+            undo="sudo systemctl start $quoted_u"
+          else
+            # No state change is required for a disabled/inactive unit.
+            continue
+          fi
+          ;;
+      esac
     fi
-    journal_add "$desc: $mode $u (was $st)" "$undo"
+
+    if ! journal_add "$desc: $mode $u (was $st; active=$active)" "$undo"; then
+      err "The change to $u was applied but its rollback entry could not be saved."
+      return 1
+    fi
   done
 }
 
